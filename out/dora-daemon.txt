@@ -1,0 +1,2 @@
+2026-01-11T11:46:07.452274Z  INFO dora: Starting in local mode
+2026-01-11T11:46:07.452910Z  INFO dora_daemon::coordinator: Connected to dora-coordinator at 127.0.0.1:53290
