@@ -30,18 +30,18 @@ NUM_EPISODES = 2
 FPS = 30
 EPISODE_TIME_SEC = 60
 TASK_DESCRIPTION = "My task description"
-HF_MODEL_ID = "<hf_username>/<model_repo_id>"
-HF_DATASET_ID = "<hf_username>/<eval_dataset_repo_id>"
+HF_MODEL_ID = "/home/ljyyds/lerobot/outputs/train/act_final/checkpoints/020000/pretrained_model"
+HF_DATASET_ID = "ljyyds/my_eval_test2"
 
 
 def main():
     # Create the robot configuration & robot
-    robot_config = LeKiwiClientConfig(remote_ip="172.18.134.136", id="lekiwi")
+    robot_config = LeKiwiClientConfig(remote_ip="192.168.132.131", id="my_awesome_kiwi")
 
     robot = LeKiwiClient(robot_config)
 
     # Create policy
-    policy = ACTPolicy.from_pretrained(HF_MODEL_ID)
+    policy = ACTPolicy.from_pretrained(HF_MODEL_ID, local_files_only=True)
 
     # Configure the dataset features
     action_features = hw_to_dataset_features(robot.action_features, ACTION)

@@ -21,29 +21,31 @@ from lerobot.robots.lekiwi.config_lekiwi import LeKiwiClientConfig
 from lerobot.robots.lekiwi.lekiwi_client import LeKiwiClient
 from lerobot.scripts.lerobot_record import record_loop
 from lerobot.teleoperators.keyboard import KeyboardTeleop, KeyboardTeleopConfig
-from lerobot.teleoperators.so100_leader import SO100Leader, SO100LeaderConfig
+from lerobot.teleoperators.so101_leader import SO101Leader, SO101LeaderConfig
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.control_utils import init_keyboard_listener
 from lerobot.utils.utils import log_say
 from lerobot.utils.visualization_utils import init_rerun
+import datetime
 
-NUM_EPISODES = 2
+NUM_EPISODES = 10
 FPS = 30
 EPISODE_TIME_SEC = 30
 RESET_TIME_SEC = 10
-TASK_DESCRIPTION = "My task description"
-HF_REPO_ID = "<hf_username>/<dataset_repo_id>"
+TASK_DESCRIPTION = "Grab the lego brick "
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+HF_REPO_ID = f"ljyyds/dataset_{timestamp}"
 
 
 def main():
     # Create the robot and teleoperator configurations
-    robot_config = LeKiwiClientConfig(remote_ip="172.18.134.136", id="lekiwi")
-    leader_arm_config = SO100LeaderConfig(port="/dev/tty.usbmodem585A0077581", id="my_awesome_leader_arm")
+    robot_config = LeKiwiClientConfig(remote_ip="192.168.132.131", id="my_awesome_kiwi")
+    leader_arm_config = SO101LeaderConfig(port="/dev/ttyACM0", id="my_awesome_leader_arm")
     keyboard_config = KeyboardTeleopConfig()
 
     # Initialize the robot and teleoperator
     robot = LeKiwiClient(robot_config)
-    leader_arm = SO100Leader(leader_arm_config)
+    leader_arm = SO101Leader(leader_arm_config)
     keyboard = KeyboardTeleop(keyboard_config)
 
     # TODO(Steven): Update this example to use pipelines

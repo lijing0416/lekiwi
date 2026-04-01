@@ -1,56 +1,61 @@
 import time
 from lerobot.robots.lekiwi import LeKiwiClient, LeKiwiClientConfig
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop, KeyboardTeleopConfig
+from lerobot.teleoperators.so101_leader import SO101Leader, SO101LeaderConfig
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 FPS = 30
 
+
 def main():
-    # 保持 ID 和 Host 一致
-    robot_config = LeKiwiClientConfig(remote_ip="127.0.0.1", id="my_awesome_kiwi")
+    # Create the robot and teleoperator configurations
+    robot_config = LeKiwiClientConfig(remote_ip="192.168.41.131", id="my_awesome_kiwi")
+    teleop_arm_config = SO101LeaderConfig(port="/dev/ttyACM0", id="my_awesome_leader_arm")
     keyboard_config = KeyboardTeleopConfig(id="my_laptop_keyboard")
 
+    # Initialize the robot and teleoperator
     robot = LeKiwiClient(robot_config)
+    leader_arm = SO101Leader(teleop_arm_config)
     keyboard = KeyboardTeleop(keyboard_config)
 
+    # Connect to the robot and teleoperator
+    # To connect you already should have this script running on LeKiwi: `python -m lerobot.robots.lekiwi.lekiwi_host --robot.id=my_awesome_kiwi`
     robot.connect()
+    leader_arm.connect()
     keyboard.connect()
 
+    # Init rerun viewer
     init_rerun(session_name="lekiwi_teleop")
 
-    if not robot.is_connected or not keyboard.is_connected:
-        raise ValueError("Robot or keyboard is not connected!")
+    if not robot.is_connected or not leader_arm.is_connected or not keyboard.is_connected:
+        raise ValueError("Robot or teleop is not connected!")
 
     print("Starting teleop loop...")
-    print("控制提示: 请确保鼠标点击本终端，使用 W/A/S/D 控制。")
-
     while True:
         t0 = time.perf_counter()
+
+        # Get robot observation
         observation = robot.get_observation()
-        
-        # 获取键盘原始输入
+
+        # Get teleop action
+        # Arm
+        arm_action = leader_arm.get_action()
+        arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
+        # Keyboard
         keyboard_keys = keyboard.get_action()
-        
-        # 转换动作
         base_action = robot._from_keyboard_to_base_action(keyboard_keys)
-        
-        # 初始化 action 防止后面 log_rerun_data 报错
-        action = {}
 
-        if len(base_action) > 0:
-            action = {**base_action}
-            # 【调试打印】如果这里有输出，说明客户端发送成功了
-            print(f"发送动作: {action}")
-            _ = robot.send_action(action)
-        else:
-            # 没按键时，不发送指令给底座（避免抖动）
-            pass
+        action = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
 
-        # 可视化（确保 action 无论如何都有定义）
+        # Send action to robot
+        _ = robot.send_action(action)
+
+        # Visualize
         log_rerun_data(observation=observation, action=action)
 
         precise_sleep(max(1.0 / FPS - (time.perf_counter() - t0), 0.0))
+
 
 if __name__ == "__main__":
     main()

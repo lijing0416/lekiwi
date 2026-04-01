@@ -40,7 +40,7 @@ def inverse_kinematics(x, y, l1=0.1159, l2=0.1350):
 # ================= 2. 主控制逻辑 =================
 
 def control_loop(robot, keyboard):
-    freq = 50
+    freq = 20
     dt = 1.0 / freq
     curr_x, curr_y = 0.1629, 0.1131
     pitch = 0.0
@@ -96,7 +96,6 @@ def main():
     config = SO100FollowerConfig(port=port)
     robot = SO100Follower(config)
 
-    # --- 核心修复：双向注入映射 ---
     print("注入底盘电机 ID 7, 8, 9...")
     chassis_ids = {"base_left_wheel": 7, "base_back_wheel": 8, "base_right_wheel": 9}
     

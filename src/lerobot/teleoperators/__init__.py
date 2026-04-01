@@ -15,5 +15,6 @@
 # limitations under the License.
 
 from .config import TeleoperatorConfig
-from .teleoperator import Teleoperator
+from .teleoperator import teleoperator
 from .utils import TeleopEvents, make_teleoperator_from_config
+from .teleoperator import Teleoperator

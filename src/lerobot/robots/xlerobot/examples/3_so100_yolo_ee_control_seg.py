@@ -610,6 +610,7 @@ def main():
             return available
         cameras = list_cameras()
         if not cameras:
+            
             print("No cameras found!")
             return
         print(f"Available cameras: {cameras}")

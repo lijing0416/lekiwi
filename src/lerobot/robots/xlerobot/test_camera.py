@@ -1,5 +1,5 @@
 import cv2
-def list_cameras(max_index=5):
+def list_cameras(max_index=10):
     available = []
     for idx in range(max_index):
         cap = cv2.VideoCapture(idx)
@@ -15,6 +15,10 @@ print(f"可用相机: {camera}")
 selected = int(input(f"从列表里选择相机 {camera}: "))       
 cap = cv2.VideoCapture(selected)
 success, frame = cap.read()
+if cap.isOpened():
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"分辨率：{width}×{height}，像素：{width*height/10000:.2f}万")
 if success:
     print("相机读取成功,按'q'键退出.")
 else:

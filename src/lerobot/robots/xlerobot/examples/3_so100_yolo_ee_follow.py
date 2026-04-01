@@ -521,7 +521,7 @@ def main():
         print(f"Initialize end effector position: x={current_x:.4f}, y={current_y:.4f}")
         
         # Initialize YOLO and camera
-        model = YOLO("yolo11x.pt")
+        model = YOLO("yolov8s-world.pt")
         
         # Get detection targets from user input
         print("\n" + "="*60)

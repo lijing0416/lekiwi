@@ -21,7 +21,7 @@ print(f"Available cameras: {cameras}")
 selected = int(input(f"Select camera index from {cameras}: "))
 
 # Load the YOLO11 model
-model = YOLO("yolo11n.pt")
+model = YOLO("yolov8s-world.pt")
 
 # Open the selected camera
 cap = cv2.VideoCapture(selected)
