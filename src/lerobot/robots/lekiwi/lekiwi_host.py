@@ -28,12 +28,21 @@ from .config_lekiwi import LeKiwiConfig, LeKiwiHostConfig
 from .lekiwi import LeKiwi
 
 
+HOST_IMAGE_SIZE = 224
+
+
 @dataclass
 class LeKiwiServerConfig:
     """Configuration for the LeKiwi host script."""
 
     robot: LeKiwiConfig = field(default_factory=LeKiwiConfig)
     host: LeKiwiHostConfig = field(default_factory=LeKiwiHostConfig)
+
+
+def resize_frame(frame, image_size: int):
+    if frame is None or frame.shape[:2] == (image_size, image_size):
+        return frame
+    return cv2.resize(frame, (image_size, image_size), interpolation=cv2.INTER_AREA)
 
 
 class LeKiwiHost:
@@ -60,6 +69,7 @@ class LeKiwiHost:
 @draccus.wrap()
 def main(cfg: LeKiwiServerConfig):
     logging.info("Configuring LeKiwi")
+    logging.info("Host camera frames will be resized to %sx%s before transmission", HOST_IMAGE_SIZE, HOST_IMAGE_SIZE)
     robot = LeKiwi(cfg.robot)
 
     logging.info("Connecting LeKiwi")
@@ -101,6 +111,7 @@ def main(cfg: LeKiwiServerConfig):
 
             # Encode ndarrays to base64 strings
             for cam_key, _ in robot.cameras.items():
+                last_observation[cam_key] = resize_frame(last_observation[cam_key], HOST_IMAGE_SIZE)
                 ret, buffer = cv2.imencode(
                     ".jpg", last_observation[cam_key], [int(cv2.IMWRITE_JPEG_QUALITY), 90]
                 )

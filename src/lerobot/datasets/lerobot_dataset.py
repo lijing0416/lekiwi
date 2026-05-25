@@ -561,7 +561,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         revision: str | None = None,
         force_cache_sync: bool = False,
         download_videos: bool = True,
-        video_backend: str | None = None,
+        video_backend="pyav",
         batch_encoding_size: int = 1,
     ):
         """

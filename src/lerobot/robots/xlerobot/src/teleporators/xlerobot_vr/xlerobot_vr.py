@@ -34,7 +34,7 @@ import numpy as np
 # from lerobot.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 from lerobot.model.SO101Robot import SO101Kinematics
 
-from ..teleoperator import Teleoperator
+from lerobot.teleoperators.teleoperator import Teleoperator
 from .configuration_xlerobot_vr import XLerobotVRTeleopConfig
 
 # Setup logging
@@ -105,13 +105,14 @@ class SimpleTeleopArm:
         self.kinematics = kinematics
         
         # Initial joint positions - adapted for XLerobot observation format
+        # Observations on real robot use joint keys without prefix, e.g. 'shoulder_pan.pos'
         self.joint_positions = {
-            "shoulder_pan": initial_obs[f"{prefix}_arm_shoulder_pan.pos"],
-            "shoulder_lift": initial_obs[f"{prefix}_arm_shoulder_lift.pos"],
-            "elbow_flex": initial_obs[f"{prefix}_arm_elbow_flex.pos"],
-            "wrist_flex": initial_obs[f"{prefix}_arm_wrist_flex.pos"],
-            "wrist_roll": initial_obs[f"{prefix}_arm_wrist_roll.pos"],
-            "gripper": initial_obs[f"{prefix}_arm_gripper.pos"],
+            "shoulder_pan": initial_obs.get("shoulder_pan.pos", 0.0),
+            "shoulder_lift": initial_obs.get("shoulder_lift.pos", 0.0),
+            "elbow_flex": initial_obs.get("elbow_flex.pos", 0.0),
+            "wrist_flex": initial_obs.get("wrist_flex.pos", 0.0),
+            "wrist_roll": initial_obs.get("wrist_roll.pos", 0.0),
+            "gripper": initial_obs.get("gripper.pos", 0.0),
         }
         
         # Set initial x/y to fixed values
@@ -305,12 +306,14 @@ class SimpleTeleopArm:
             dict: Action dictionary with position commands for each joint
         """
         obs = robot_obs
-        current = {j: obs[f"{self.prefix}_arm_{j}.pos"] for j in self.joint_map}
+        # Real robot observation keys are like 'shoulder_pan.pos'
+        current = {j: obs.get(f"{j}.pos", 0.0) for j in self.joint_map}
         action = {}
         for j in self.target_positions:
             error = self.target_positions[j] - current[j]
             control = self.kp * error
-            action[f"{self.joint_map[j]}.pos"] = current[j] + control
+            # Send actions using base joint names expected by the motors
+            action[f"{j}.pos"] = current[j] + control
         return action
 
 
@@ -639,6 +642,33 @@ class XLerobotVRTeleop(Teleoperator):
                 action.update(right_action)
                 action.update(head_action)
                 action.update(base_action)
+                # Debug: print observation keys and actions when logger is DEBUG
+                if logger.isEnabledFor(logging.DEBUG):
+                    try:
+                        logger.debug(f"OBS_KEYS: {list(robot_obs.keys())[:80]}")
+                        logger.debug(f"LEFT_ACTION: {left_action}")
+                        logger.debug(f"RIGHT_ACTION: {right_action}")
+                        logger.debug(f"HEAD_ACTION: {head_action}")
+                        logger.debug(f"BASE_ACTION: {base_action}")
+                        logger.debug(f"MERGED_ACTION: {action}")
+                    except Exception as e:
+                        logger.debug(f"Failed to log VR debug info: {e}")
+                # Normalize action keys to robot's motor keys (e.g. right_arm_shoulder_pan.pos -> shoulder_pan.pos)
+                try:
+                    import re
+                    normalized = {}
+                    for k, v in action.items():
+                        m = re.match(r'^(?:left|right)_arm_(.+?)(?:\.pos)?$', k)
+                        if m:
+                            newk = f"{m.group(1)}.pos"
+                        else:
+                            newk = k
+                        normalized[newk] = v
+                    if normalized != action and logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f"Normalized action keys: {normalized}")
+                    action = normalized
+                except Exception:
+                    pass
                 
             except Exception as e:
                 logger.error(f"Action generation failed: {e}")

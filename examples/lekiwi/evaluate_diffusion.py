@@ -1,96 +1,133 @@
 import torch
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
+from lerobot.policies.factory import make_pre_post_processors
 from tqdm import tqdm
 import numpy as np
+import torchvision.transforms.functional as TF
 
-# --- 配置路径 ---
-CHECKPOINT_PATH = "outputs/train/diffusion_final_fixed/checkpoints/020000/pretrained_model"
-REPO_ID = "ljyyds/dataset_combined"
+CHECKPOINT_PATH = "/home/ljyyds/lerobot/outputs/train/train/diffusion_aloha_merged_20260517_11datasets_bs32_aug/checkpoints/050000/pretrained_model"
+REPO_ID = "/home/ljyyds/.cache/huggingface/lerobot/ljyyds/aloha_merged_20260517_11datasets"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MAX_SAMPLES = 800
 
-def evaluate_diffusion():
-    # 1. 加载模型
-    print(f"正在加载微型扩散模型...")
+def evaluate_diffusion_final():
+    print("正在加载 Diffusion 模型...")
     policy = DiffusionPolicy.from_pretrained(CHECKPOINT_PATH).to(DEVICE)
     policy.eval()
+    policy.config.device = DEVICE
 
-    # 2. 加载数据集
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy.config,
+        pretrained_path=CHECKPOINT_PATH,
+        preprocessor_overrides={"device_processor": {"device": DEVICE}},
+        postprocessor_overrides={"device_processor": {"device": "cpu"}},
+    )
+
     dataset = LeRobotDataset(REPO_ID)
+
     ep_info = dataset.meta.episodes[0]
     start_idx = ep_info["dataset_from_index"]
-    end_idx = ep_info["dataset_to_index"]
-    
-    gt_actions = []
-    pred_actions = []
-    
-    print(f"开始扩散去噪推理 (Horizon: {policy.config.horizon})...")
-    
+    end_idx = min(ep_info["dataset_to_index"], start_idx + MAX_SAMPLES)
+
+    gt_actions, pred_actions = [], []
+
+    prev_ep = None
+    policy.reset()
+
+    print("开始连续推理循环...")
     with torch.no_grad():
         for i in tqdm(range(start_idx, end_idx)):
             item = dataset[i]
-            
-            # 准备 Observation
-            observation = {}
-            for k, v in item.items():
-                if "observation.image" in k:
-                    observation[k] = v.unsqueeze(0).to(DEVICE) # [1, C, H, W]
-                elif "observation.state" in k:
-                    observation[k] = v.unsqueeze(0).to(DEVICE) # [1, D]
 
-            # 执行推理
-            try:
-                action_prediction = policy.select_action(observation)
-            except RuntimeError:
-                # 兼容性修复：如果模型要求特定维度
-                for k in observation:
-                    observation[k] = observation[k].reshape(-1, *observation[k].shape[2:])
-                action_prediction = policy.select_action(observation)
-            
-            # --- 核心修复：提取 Action 并存入列表 ---
-            # action_prediction 可能是 Tensor 或 Numpy，统一转为 Numpy
-            if torch.is_tensor(action_prediction):
-                action_prediction = action_prediction.cpu().numpy()
+            # ✅ episode 切换 reset（必须保留）
+            current_ep = item["episode_index"]
+            current_ep = current_ep.item() if isinstance(current_ep, torch.Tensor) else current_ep
+            if prev_ep is not None and current_ep != prev_ep:
+                policy.reset()
+            prev_ep = current_ep
 
-            # 自动处理维度 [Batch, Horizon, Dim] -> 取第一步 [Dim]
-            if action_prediction.ndim == 3:
-                pred_step = action_prediction[0, 0, :]
-            elif action_prediction.ndim == 2:
-                pred_step = action_prediction[0, :]
-            else:
-                pred_step = action_prediction.flatten()
+            obs_dict = {}
 
-            # 收集数据
-            gt_actions.append(item["action"].numpy())
-            pred_actions.append(pred_step)
+            # ===== 单帧输入 =====
+            for key in policy.config.input_features:
+                data = item[key]
 
-    # 3. 转换为数组并确保维度为 (N, action_dim)
+                if "image" in key:
+                    if not isinstance(data, torch.Tensor):
+                        data = torch.from_numpy(data)
+
+                    if data.ndim == 3 and data.shape[-1] == 3:
+                        data = data.permute(2, 0, 1)
+
+                    if data.dtype == torch.uint8:
+                        data = data.float() / 255.0
+                    elif data.max() > 1.0:
+                        data = data.float() / 255.0
+                    else:
+                        data = data.float()
+
+                    data = TF.resize(data, [224, 224], antialias=True)
+
+                else:
+                    data = torch.as_tensor(data, dtype=torch.float32)
+
+                obs_dict[key] = data
+
+            # ===== 推理 =====
+            obs_dict = preprocessor(obs_dict)
+            action = policy.select_action(obs_dict)  # (1,D), normalized
+            action_phys = postprocessor(action)
+
+            # ===== 🔥 打印范围（必须看）=====
+            print("action range:", action.min().item(), action.max().item())
+
+            gt_val = item["action"].numpy() if isinstance(item["action"], torch.Tensor) else item["action"]
+
+            gt_actions.append(gt_val)
+            pred_actions.append(action_phys.cpu().numpy())
+
+    # ===== 后处理 =====
     gt_actions = np.array(gt_actions)
     pred_actions = np.array(pred_actions)
 
-    if gt_actions.ndim == 1: gt_actions = gt_actions.reshape(-1, 1)
-    if pred_actions.ndim == 1: pred_actions = pred_actions.reshape(-1, 1)
+    if pred_actions.ndim == 3:
+        pred_actions = pred_actions.squeeze(1)
 
-    # 4. 绘图与 MSE 计算
+    error = gt_actions - pred_actions
+    mse = np.mean(error**2)
+    rmse = np.sqrt(mse)
+    mae = np.mean(np.abs(error))
+    per_dim_rmse = np.sqrt(np.mean(error**2, axis=0))
+    per_dim_mae = np.mean(np.abs(error), axis=0)
+
+    print(f"\n物理量纲还原成功！MSE: {mse:.6f} | RMSE: {rmse:.6f} | MAE: {mae:.6f}")
+    print("Per-dim RMSE:", np.array2string(per_dim_rmse, precision=4, suppress_small=True))
+    print("Per-dim MAE :", np.array2string(per_dim_mae, precision=4, suppress_small=True))
+
+    # ===== 画图 =====
     action_dim = gt_actions.shape[1]
-    fig, axes = plt.subplots(action_dim, 1, figsize=(12, 2 * action_dim))
-    if action_dim == 1: axes = [axes]
+    fig, axes = plt.subplots(action_dim, 1, figsize=(12, 2.5 * action_dim))
+    if action_dim == 1:
+        axes = [axes]
 
     for d in range(action_dim):
-        axes[d].plot(gt_actions[:, d], label="Demo (Real)", color="blue", alpha=0.5)
-        axes[d].plot(pred_actions[:, d], label="Diffusion (Tiny)", color="green", linestyle="--")
+        axes[d].plot(gt_actions[:, d], label="GT", linewidth=1.5)
+        axes[d].plot(pred_actions[:, d], "--", label="Pred")
         axes[d].set_ylabel(f"Dim {d}")
-        axes[d].legend()
-    
-    mse = np.mean((gt_actions - pred_actions)**2)
-    plt.suptitle(f"DIFFUSION EVAL | MSE: {mse:.6f}")
+        axes[d].grid(True)
+        if d == 0:
+            axes[d].legend()
+
+    plt.suptitle(f"MSE: {mse:.4f} | RMSE: {rmse:.4f} | MAE: {mae:.4f}")
     plt.tight_layout()
-    plt.savefig("diffusion_eval_result.png")
-    
-    print(f"\n推理完成！MSE: {mse:.6f}")
-    print("对比图已保存至: diffusion_eval_result.png")
-    plt.show()
+    plt.savefig("final_fixed_eval.png")
+
+    print("图已保存: final_fixed_eval.png")
+
 
 if __name__ == "__main__":
-    evaluate_diffusion()
+    evaluate_diffusion_final()

@@ -21,30 +21,62 @@ from lerobot.robots.lekiwi.config_lekiwi import LeKiwiClientConfig
 from lerobot.robots.lekiwi.lekiwi_client import LeKiwiClient
 from lerobot.scripts.lerobot_record import record_loop
 from lerobot.teleoperators.keyboard import KeyboardTeleop, KeyboardTeleopConfig
-from lerobot.teleoperators.so101_leader import SO101Leader, SO101LeaderConfig
+from lerobot.teleoperators.so101_leader import SO101Leader, SO101LeaderConfig   
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.control_utils import init_keyboard_listener
 from lerobot.utils.utils import log_say
 from lerobot.utils.visualization_utils import init_rerun
+from dataclasses import replace
 import datetime
+import cv2
 
-NUM_EPISODES = 10
+NUM_EPISODES = 50
 FPS = 30
 EPISODE_TIME_SEC = 30
 RESET_TIME_SEC = 10
 TASK_DESCRIPTION = "Grab the lego brick "
+IMAGE_SIZE = 224
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 HF_REPO_ID = f"ljyyds/dataset_{timestamp}"
 
 
+class ResizeCameraObservationWrapper:
+    """Resize camera observations before they are saved to the dataset."""
+
+    def __init__(self, robot: LeKiwiClient, image_size: int):
+        self._robot = robot
+        self._image_size = image_size
+        self._camera_keys = tuple(robot.config.cameras)
+
+    def __getattr__(self, name):
+        return getattr(self._robot, name)
+
+    def get_observation(self):
+        obs = self._robot.get_observation()
+        for camera_key in self._camera_keys:
+            frame = obs.get(camera_key)
+            if frame is None:
+                continue
+            obs[camera_key] = cv2.resize(
+                frame,
+                (self._image_size, self._image_size),
+                interpolation=cv2.INTER_AREA,
+            )
+        return obs
+
+
 def main():
     # Create the robot and teleoperator configurations
-    robot_config = LeKiwiClientConfig(remote_ip="192.168.132.131", id="my_awesome_kiwi")
+    robot_config = LeKiwiClientConfig(remote_ip="192.168.0.131", id="my_awesome_kiwi")
+    robot_config.cameras = {
+        name: replace(camera, width=IMAGE_SIZE, height=IMAGE_SIZE)
+        for name, camera in robot_config.cameras.items()
+    }
     leader_arm_config = SO101LeaderConfig(port="/dev/ttyACM0", id="my_awesome_leader_arm")
     keyboard_config = KeyboardTeleopConfig()
-
+    
     # Initialize the robot and teleoperator
-    robot = LeKiwiClient(robot_config)
+    robot = ResizeCameraObservationWrapper(LeKiwiClient(robot_config), IMAGE_SIZE)
     leader_arm = SO101Leader(leader_arm_config)
     keyboard = KeyboardTeleop(keyboard_config)
 

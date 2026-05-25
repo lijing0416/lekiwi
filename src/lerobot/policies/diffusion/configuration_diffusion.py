@@ -106,7 +106,7 @@ class DiffusionConfig(PreTrainedConfig):
     # Inputs / output structure.
     n_obs_steps: int = 2
     horizon: int = 16
-    n_action_steps: int = 8
+    n_action_steps: int = 4
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -123,6 +123,8 @@ class DiffusionConfig(PreTrainedConfig):
     # Architecture / modeling.
     # Vision backbone.
     vision_backbone: str = "resnet18"
+    resize_shape: tuple[int, int] | None = None
+    crop_ratio: float = 1.0
     crop_shape: tuple[int, int] | None = (84, 84)
     crop_is_random: bool = True
     pretrained_backbone_weights: str | None = None
@@ -147,6 +149,8 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Inference
     num_inference_steps: int | None = None
+    compile_model: bool = False
+    compile_mode: str = "reduce-overhead"
 
     # Loss computation
     do_mask_loss_for_padding: bool = False
@@ -158,6 +162,7 @@ class DiffusionConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-6
     scheduler_name: str = "cosine"
     scheduler_warmup_steps: int = 500
+    use_peft: bool = False
 
     def __post_init__(self):
         super().__post_init__()

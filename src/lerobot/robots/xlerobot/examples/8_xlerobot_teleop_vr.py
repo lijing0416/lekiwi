@@ -5,38 +5,43 @@ Uses handle_vr_input with delta action control
 """
 
 # Standard library imports
+import argparse
 import asyncio
+from functools import cached_property
+import glob
 import logging
 import math
+import os
 import sys
 import threading
 import time
 import traceback
+from typing import Any
+from pathlib import Path
 
 # Third-party imports
-import numpy as np
 import pygame
+
+# Add XleVR path to allow vr_monitor import
+XLEVR_PATH = str(Path(__file__).parent.parent / "XleVR")
+if XLEVR_PATH not in sys.path:
+    sys.path.insert(0, XLEVR_PATH)
 
 # Local imports
 from vr_monitor import VRMonitor
-from lerobot.robots.xlerobot import XLerobotConfig, XLerobot
-from lerobot.utils.robot_utils import busy_wait
-from lerobot.model.SO101Robot import SO101Kinematics
+from lerobot.motors import Motor, MotorCalibration, MotorNormMode
+from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
+from lerobot.robots.xlerobot.src.robots.xlerobot.config_xlerobot import XLerobotConfig
+from lerobot.robots.robot import Robot
+from lerobot.robots.utils import ensure_safe_goal_position
+from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
+from lerobot.robots.xlerobot.src.model.SO101Robot import SO101Kinematics
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Joint mapping configurations
-LEFT_JOINT_MAP = {
-    "shoulder_pan": "left_arm_shoulder_pan",
-    "shoulder_lift": "left_arm_shoulder_lift",
-    "elbow_flex": "left_arm_elbow_flex",
-    "wrist_flex": "left_arm_wrist_flex",
-    "wrist_roll": "left_arm_wrist_roll",
-    "gripper": "left_arm_gripper",
-}
-
 RIGHT_JOINT_MAP = {
     "shoulder_pan": "right_arm_shoulder_pan",
     "shoulder_lift": "right_arm_shoulder_lift",
@@ -46,10 +51,162 @@ RIGHT_JOINT_MAP = {
     "gripper": "right_arm_gripper",
 }
 
-HEAD_MOTOR_MAP = {
-    "head_motor_1": "head_motor_1",
-    "head_motor_2": "head_motor_2",
-}
+
+class SingleRightArmXLerobot(Robot):
+    """XLerobot-compatible robot wrapper that connects only the right arm bus."""
+
+    config_class = XLerobotConfig
+    name = "xlerobot"
+
+    def __init__(self, config: XLerobotConfig, port: str):
+        super().__init__(config)
+        self.config = config
+        self.port = port
+        norm_mode = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
+        calibration = {
+            name: self.calibration[name]
+            for name in RIGHT_JOINT_MAP.values()
+            if name in self.calibration
+        }
+        self.bus = FeetechMotorsBus(
+            port=port,
+            motors={
+                "right_arm_shoulder_pan": Motor(1, "sts3215", norm_mode),
+                "right_arm_shoulder_lift": Motor(2, "sts3215", norm_mode),
+                "right_arm_elbow_flex": Motor(3, "sts3215", norm_mode),
+                "right_arm_wrist_flex": Motor(4, "sts3215", norm_mode),
+                "right_arm_wrist_roll": Motor(5, "sts3215", norm_mode),
+                "right_arm_gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
+            },
+            calibration=calibration,
+        )
+        self.right_arm_motors = list(self.bus.motors)
+
+    @cached_property
+    def observation_features(self) -> dict[str, type]:
+        return dict.fromkeys((f"{name}.pos" for name in self.right_arm_motors), float)
+
+    @cached_property
+    def action_features(self) -> dict[str, type]:
+        return self.observation_features
+
+    @property
+    def is_connected(self) -> bool:
+        return self.bus.is_connected
+
+    @property
+    def is_calibrated(self) -> bool:
+        if not self.bus.calibration:
+            return False
+        try:
+            return self.bus.is_calibrated
+        except Exception:
+            return False
+
+    def connect(self, calibrate: bool = True) -> None:
+        if self.is_connected:
+            raise DeviceAlreadyConnectedError(f"{self} already connected")
+
+        self.bus.connect()
+
+        missing_calibration = [name for name in self.right_arm_motors if name not in self.bus.calibration]
+        if missing_calibration:
+            if not calibrate:
+                raise RuntimeError(
+                    "No complete right-arm calibration found. Missing: "
+                    f"{missing_calibration}. Run once without --no-calibrate to create it."
+                )
+            self.calibrate()
+        else:
+            try:
+                self.bus.write_calibration(self.bus.calibration)
+                logger.info("Right-arm calibration restored from %s", self.calibration_fpath)
+            except Exception as e:
+                logger.warning("Failed to write saved calibration to motors: %s", e)
+                if calibrate:
+                    self.calibrate()
+
+        self.configure()
+        logger.info("%s connected on %s.", self, self.port)
+
+    def calibrate(self) -> None:
+        logger.info("Running calibration for right arm only")
+        self.bus.disable_torque()
+        for name in self.right_arm_motors:
+            self.bus.write("Operating_Mode", name, OperatingMode.POSITION.value)
+
+        input("Move right arm motors to the middle of their range of motion and press ENTER....")
+        homing_offsets = self.bus.set_half_turn_homings(self.right_arm_motors)
+
+        print(
+            "Move all right arm joints sequentially through their entire ranges of motion.\n"
+            "Recording positions. Press ENTER to stop..."
+        )
+        range_mins, range_maxes = self.bus.record_ranges_of_motion(self.right_arm_motors)
+
+        calibration = {
+            name: MotorCalibration(
+                id=motor.id,
+                drive_mode=0,
+                homing_offset=homing_offsets[name],
+                range_min=range_mins[name],
+                range_max=range_maxes[name],
+            )
+            for name, motor in self.bus.motors.items()
+        }
+        self.bus.write_calibration(calibration)
+        self.calibration.update(calibration)
+        self._save_calibration()
+        print("Calibration saved to", self.calibration_fpath)
+
+    def configure(self) -> None:
+        self.bus.disable_torque()
+        self.bus.configure_motors()
+        for name in self.right_arm_motors:
+            self.bus.write("Operating_Mode", name, OperatingMode.POSITION.value)
+            self.bus.write("P_Coefficient", name, 16)
+            self.bus.write("I_Coefficient", name, 0)
+            self.bus.write("D_Coefficient", name, 43)
+        self.bus.enable_torque()
+
+    def get_observation(self) -> dict[str, Any]:
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        arm_pos = self.bus.sync_read("Present_Position", self.right_arm_motors)
+        return {f"{name}.pos": value for name, value in arm_pos.items()}
+
+    def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        right_arm_pos = {
+            key: value
+            for key, value in action.items()
+            if key.startswith("right_arm_") and key.endswith(".pos")
+        }
+
+        if self.config.max_relative_target is not None and right_arm_pos:
+            present_pos = self.bus.sync_read("Present_Position", self.right_arm_motors)
+            safe_goal_pos = ensure_safe_goal_position(
+                {
+                    key.replace(".pos", ""): (goal, present_pos[key.replace(".pos", "")])
+                    for key, goal in right_arm_pos.items()
+                },
+                self.config.max_relative_target,
+            )
+            right_arm_pos = {f"{key}.pos": value for key, value in safe_goal_pos.items()}
+
+        right_arm_pos_raw = {key.replace(".pos", ""): value for key, value in right_arm_pos.items()}
+        if right_arm_pos_raw:
+            self.bus.sync_write("Goal_Position", right_arm_pos_raw)
+        return right_arm_pos
+
+    def disconnect(self):
+        if not self.is_connected:
+            return
+        self.bus.disconnect(self.config.disable_torque_on_disconnect)
+        logger.info("%s disconnected.", self)
 
 # Joint calibration coefficients - manually edit
 # Format: [joint_name, zero_position_offset(degrees), scale_factor]
@@ -161,12 +318,10 @@ class SimpleTeleopArm:
             self.prev_vr_pos = current_vr_pos
             return  # Skip first frame to establish baseline
         
-        print(current_vr_pos)
-        
         # Calculate relative change (delta) from previous frame
-        vr_x = (current_vr_pos[0] - self.prev_vr_pos[0]) * 220 # Scale for the shoulder
-        vr_y = (current_vr_pos[1] - self.prev_vr_pos[1]) * 70 
-        vr_z = (current_vr_pos[2] - self.prev_vr_pos[2]) * 70
+        vr_x = (current_vr_pos[0] - self.prev_vr_pos[0]) * 100 # Scale for the shoulder
+        vr_y = (current_vr_pos[1] - self.prev_vr_pos[1]) * 50 
+        vr_z = (current_vr_pos[2] - self.prev_vr_pos[2]) * 15
 
         # print(f'vr_x: {vr_x}, vr_y: {vr_y}, vr_z: {vr_z}')
 
@@ -175,7 +330,7 @@ class SimpleTeleopArm:
         
         # Delta control parameters - adjust these for sensitivity
         pos_scale = 0.01  # Position sensitivity scaling
-        angle_scale = 4.0  # Angle sensitivity scaling
+        angle_scale = 1.0  # Angle sensitivity scaling
         delta_limit = 0.01  # Maximum delta per update (meters)
         angle_limit = 8.0  # Maximum angle delta per update (degrees)
         
@@ -188,8 +343,8 @@ class SimpleTeleopArm:
         delta_y = max(-delta_limit, min(delta_limit, delta_y))
         delta_z = max(-delta_limit, min(delta_limit, delta_z))
         
-        self.current_x += -delta_z  # yy: VR Z maps to robot x, change the direction
-        self.current_y += delta_y  # yy:VR Y maps to robot y
+        self.current_x += -delta_y  # VR Y is forward/backward in XleVR
+        self.current_y += delta_z  # VR Z is up/down in XleVR
 
         # Handle wrist angles with delta control - use relative changes
         if hasattr(vr_goal, 'wrist_flex_deg') and vr_goal.wrist_flex_deg is not None:
@@ -201,7 +356,7 @@ class SimpleTeleopArm:
             # Calculate relative change from previous frame
             delta_pitch = (vr_goal.wrist_flex_deg - self.prev_wrist_flex) * angle_scale
             delta_pitch = max(-angle_limit, min(angle_limit, delta_pitch))
-            self.pitch += delta_pitch
+            self.pitch -= delta_pitch
             self.pitch = max(-90, min(90, self.pitch))  # Limit pitch range
             
             # Update previous value for next frame
@@ -273,173 +428,52 @@ class SimpleTeleopArm:
         return action
 
 
-class SimpleHeadControl:
-    """
-    A class for controlling robot head motors using VR thumbstick input.
-    
-    Provides simple head movement control with proportional control for smooth operation.
-    """
-    
-    def __init__(self, initial_obs, kp=1):
-        self.kp = kp
-        self.degree_step = 2  # Move 2 degrees each time
-        # Initialize head motor positions
-        self.target_positions = {
-            "head_motor_1": initial_obs.get("head_motor_1.pos", 0.0),
-            "head_motor_2": initial_obs.get("head_motor_2.pos", 0.0),
-        }
-        self.zero_pos = {"head_motor_1": 0.0, "head_motor_2": 0.0}
+def resolve_arm_port(requested_port: str | None, fallback_port: str) -> str:
+    if requested_port:
+        return requested_port
 
-    def handle_vr_input(self, vr_goal):
-        # Map VR input to head motor targets
-        thumb = vr_goal.metadata.get('thumbstick', {})
-        if thumb:
-            thumb_x = thumb.get('x', 0)
-            thumb_y = thumb.get('y', 0)
-            if abs(thumb_x) > 0.1:
-                if thumb_x > 0:
-                    self.target_positions["head_motor_1"] += self.degree_step
-                else:
-                    self.target_positions["head_motor_1"] -= self.degree_step
-            if abs(thumb_y) > 0.1:
-                if thumb_y > 0:
-                    self.target_positions["head_motor_2"] += self.degree_step
-                else:
-                    self.target_positions["head_motor_2"] -= self.degree_step
-                    
-    def move_to_zero_position(self, robot):
-        print(f"[HEAD] Moving to Zero Position: {self.zero_pos} ......")
-        self.target_positions = self.zero_pos.copy()
-        action = self.p_control_action(robot)
-        robot.send_action(action)
+    candidates = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
+    if fallback_port in candidates:
+        return fallback_port
+    if len(candidates) == 1:
+        print(f"[MAIN] Auto-selected single detected serial port: {candidates[0]}")
+        return candidates[0]
 
-    def p_control_action(self, robot):
-        """
-        Generate proportional control action for head motors.
-        
-        Args:
-            robot: Robot instance to get current observations
-            
-        Returns:
-            dict: Action dictionary with position commands for head motors
-        """
-        obs = robot.get_observation()
-        action = {}
-        for motor in self.target_positions:
-            current = obs.get(f"{HEAD_MOTOR_MAP[motor]}.pos", 0.0)
-            error = self.target_positions[motor] - current
-            control = self.kp * error
-            action[f"{HEAD_MOTOR_MAP[motor]}.pos"] = current + control
-        return action
+    print(f"[MAIN] Using default right-arm port: {fallback_port}")
+    if candidates:
+        print(f"[MAIN] Available serial ports: {', '.join(candidates)}")
+    return fallback_port
 
 
-def get_vr_base_action(vr_goal, robot):
-    """
-    Get base control commands from VR input.
-    
-    Args:
-        vr_goal: VR controller goal data containing metadata
-        robot: Robot instance for action conversion
-        
-    Returns:
-        dict: Base movement actions based on VR thumbstick input
-    """
-    if vr_goal is None or not hasattr(vr_goal, 'metadata'):
-        return {}
-    
-    # Build key set based on VR input (you can customize this mapping)
-    pressed_keys = set()
-    
-    # Example VR to base movement mapping - adjust according to your VR system
-    # You may need to customize these mappings based on your VR controller buttons
-    thumb = vr_goal.metadata.get('thumbstick', {})
-    if thumb:
-        thumb_x = thumb.get('x', 0)
-        thumb_y = thumb.get('y', 0)
-        if abs(thumb_x) > 0.2:
-            if thumb_x > 0:
-                pressed_keys.add('o')  # Move backward
-            else:
-                pressed_keys.add('u')  # Move forward
-        if abs(thumb_y) > 0.2:
-            if thumb_y > 0:
-                pressed_keys.add('k')  # Move right
-            else:
-                pressed_keys.add('i')  # Move backward
-    
-    # Convert to numpy array and get base action
-    keyboard_keys = np.array(list(pressed_keys))
-    base_action = robot._from_keyboard_to_base_action(keyboard_keys) or {}
-    
-    return base_action
-
-
-# Base speed control parameters - adjustable slopes
-BASE_ACCELERATION_RATE = 2.0  # acceleration slope (speed/second)
-BASE_DECELERATION_RATE = 2.5  # deceleration slope (speed/second)
-BASE_MAX_SPEED = 3.0          # maximum speed multiplier
-
-
-def get_vr_speed_control(vr_goal):
-    """
-    Get speed control from VR input with linear acceleration and deceleration.
-    
-    Linearly accelerates to maximum speed when holding any base control input,
-    and linearly decelerates to 0 when released.
-    
-    Args:
-        vr_goal: VR controller goal data
-        
-    Returns:
-        float: Current speed multiplier (0.0 to BASE_MAX_SPEED)
-    """
-    global current_base_speed, last_update_time, is_accelerating
-    
-    # Initialize global variables
-    if 'current_base_speed' not in globals():
-        current_base_speed = 0.0
-        last_update_time = time.time()
-        is_accelerating = False
-    
-    current_time = time.time()
-    dt = current_time - last_update_time
-    last_update_time = current_time
-    
-    # Check if any base control input is active from VR
-    any_base_input_active = False
-    if vr_goal and hasattr(vr_goal, 'metadata'):
-        thumb = vr_goal.metadata.get('thumbstick', {})
-        if thumb:
-            thumb_x = thumb.get('x', 0)
-            thumb_y = thumb.get('y', 0)
-            # Check if thumbstick is being used for base movement
-            any_base_input_active = abs(thumb_x) > 0.2 or abs(thumb_y) > 0.2
-    
-    if any_base_input_active:
-        # VR input active - accelerate
-        if not is_accelerating:
-            is_accelerating = True
-            print("[BASE] Starting acceleration")
-        
-        # Linear acceleration
-        current_base_speed += BASE_ACCELERATION_RATE * dt
-        current_base_speed = min(current_base_speed, BASE_MAX_SPEED)
-        
-    else:
-        # No VR input - decelerate
-        if is_accelerating:
-            is_accelerating = False
-            print("[BASE] Starting deceleration")
-        
-        # Linear deceleration
-        current_base_speed -= BASE_DECELERATION_RATE * dt
-        current_base_speed = max(current_base_speed, 0.0)
-    
-    # Print current speed (optional, for debugging)
-    if abs(current_base_speed) > 0.01:  # Only print when speed is not 0
-        print(f"[BASE] Current speed: {current_base_speed:.2f}")
-    
-    return current_base_speed
+def parse_args():
+    parser = argparse.ArgumentParser(description="Control one XLerobot arm with the VR right controller.")
+    parser.add_argument(
+        "--port",
+        default=os.environ.get("XLEROBOT_ARM_PORT"),
+        help="Serial port for the right arm. Defaults to XLEROBOT_ARM_PORT, then robot.port2.",
+    )
+    parser.add_argument(
+        "--robot-id",
+        default=None,
+        help="Robot id used for loading/saving calibration. Defaults to the existing XLerobotConfig id.",
+    )
+    parser.add_argument(
+        "--no-calibrate",
+        action="store_true",
+        help="Do not run manual calibration if a right-arm calibration file is missing.",
+    )
+    parser.add_argument(
+        "--use-degrees",
+        action="store_true",
+        help="Use degree-normalized joint positions instead of the default -100..100 range.",
+    )
+    parser.add_argument(
+        "--elbow-min-deg",
+        type=float,
+        default=-90.0,
+        help="Minimum internal elbow IK angle in degrees. Lower values increase forward reach.",
+    )
+    return parser.parse_args()
 
 
 def main():
@@ -447,31 +481,33 @@ def main():
     Main function for VR teleoperation of XLerobot.
     
     Initializes the robot connection, VR monitoring, and runs the main control loop
-    for dual-arm robot control with VR input.
+    for one-arm robot control with the VR right controller.
     """
-    print("XLerobot VR Control Example")
+    args = parse_args()
+    print("XLerobot Single-Arm VR Control Example")
     print("="*50)
     
     # Initialize pygame for keyboard input handling
     pygame.init()
+    robot = None
 
     try:
-        # Try to use saved calibration file to avoid recalibrating each time
-        # You can modify robot_id here to match your robot configuration
-        robot_config = XLerobotConfig()  # Can be modified to your robot ID
-        robot = XLerobot(robot_config)
+        robot_config = XLerobotConfig(id=args.robot_id, use_degrees=args.use_degrees)
+        arm_port = resolve_arm_port(args.port, robot_config.port2)
+        robot = SingleRightArmXLerobot(robot_config, arm_port)
         
         try:
-            robot.connect()
-            print(f"[MAIN] Successfully connected to robot")
+            robot.connect(calibrate=not args.no_calibrate)
+            print(f"[MAIN] Successfully connected to right arm on {arm_port}")
             if robot.is_calibrated:
-                print(f"[MAIN] Robot is calibrated and ready to use!")
+                print(f"[MAIN] Right arm is calibrated and ready to use!")
             else:
-                print(f"[MAIN] Robot requires calibration")
+                print(f"[MAIN] Right arm requires calibration")
         except Exception as e:
-            print(f"[MAIN] Failed to connect to robot: {e}")
+            print(f"[MAIN] Failed to connect to right arm: {e}")
             print(f"[MAIN] Robot config: {robot_config}")
             print(f"[MAIN] Robot: {robot}")
+            print("[MAIN] Tip: pass the correct port, for example: --port /dev/ttyACM0")
             return
         
         # Initialize VR monitor
@@ -485,55 +521,31 @@ def main():
         vr_thread.start()
         print("✅ VR system ready")
 
-        # Init the arm and head instances
+        # Init the right arm controller. VR left controller, head, and base are intentionally unused.
         obs = robot.get_observation()
-        kin_left = SO101Kinematics()
-        kin_right = SO101Kinematics()
-        left_arm = SimpleTeleopArm(LEFT_JOINT_MAP, obs, kin_left, prefix="left")
+        kin_right = SO101Kinematics(joint3_limits=(math.radians(args.elbow_min_deg), math.pi))
         right_arm = SimpleTeleopArm(RIGHT_JOINT_MAP, obs, kin_right, prefix="right")
-        head_control = SimpleHeadControl(obs)
 
-        # Move both arms and head to zero position at start
-        left_arm.move_to_zero_position(robot)
+        # Move the controlled arm to zero position at start
         right_arm.move_to_zero_position(robot)
-        head_control.move_to_zero_position(robot)
         
         # Main VR control loop
-        print("Starting VR control loop. Press ESC to exit.")
+        print("Starting right-controller VR control loop. Press ESC to exit.")
         try:
             while True:
                 # Get VR controller data
                 dual_goals = vr_monitor.get_latest_goal_nowait()
-                left_goal = dual_goals.get("left") if dual_goals else None
                 right_goal = dual_goals.get("right") if dual_goals else None
-                headset_goal = dual_goals.get("headset") if dual_goals else None
 
                 # Wait for VR connection before proceeding
                 if dual_goals is None:
                     time.sleep(0.01)  # Wait 10ms for VR connection
                     continue
 
-                # Handle VR input for both arms
-                left_arm.handle_vr_input(left_goal, gripper_state=None)
+                # Handle VR input for the right arm only
                 right_arm.handle_vr_input(right_goal, gripper_state=None)
                 
-                # Get actions from both arms and head
-                left_action = left_arm.p_control_action(robot)
-                right_action = right_arm.p_control_action(robot)
-                head_action = head_control.p_control_action(robot)
-
-                # Get base control from VR
-                print(f'right_goal: {right_goal}')
-                base_action = get_vr_base_action(right_goal, robot)
-                # speed_multiplier = get_vr_speed_control(right_goal)
-                
-                # if base_action:
-                #     for key in base_action:
-                #         if 'vel' in key or 'velocity' in key:  
-                            # base_action[key] *= speed_multiplier 
-
-                # Merge all actions
-                action = {**left_action, **right_action, **head_action, **base_action}
+                action = right_arm.p_control_action(robot)
                 robot.send_action(action)
                 
                 # Handle keyboard exit (press ESC to quit)
@@ -550,7 +562,8 @@ def main():
                 break  # Break the while loop if a break occurred in the for loop
                 
         finally:
-            robot.disconnect()
+            if robot is not None:
+                robot.disconnect()
             print("VR teleoperation ended.")
         
     except Exception as e:
@@ -564,7 +577,8 @@ def main():
         except:
             pass
         try:
-            robot.disconnect()
+            if robot is not None:
+                robot.disconnect()
         except:
             pass
 

@@ -10,13 +10,11 @@ from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraCon
 from lerobot.cameras import ColorMode, Cv2Rotation
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 
-def create_real_robot(port, camera_index, uid: str = "so101") -> Robot:
+def create_real_robot(port, camera_index, uid: str = "so101", enable_camera: bool = True) -> Robot:
     """Wrapper function to map string UIDS to real robot configurations. Primarily for saving a bit of code for users when they fork the repository. They can just edit the camera, id etc. settings in this one file."""
     if uid == "so101":
-        robot_config = SO101FollowerConfig(
-            port= port,
-            use_degrees=True,
-            # for phone camera users you can use the commented out setting below
+        cameras = {}
+        if enable_camera:
             cameras = {
                 "base_camera": OpenCVCameraConfig(index_or_path= camera_index,  # Replace with camera index found in find_cameras.py
                 fps=30,
@@ -24,7 +22,13 @@ def create_real_robot(port, camera_index, uid: str = "so101") -> Robot:
                 height=480,
                 color_mode=ColorMode.RGB,
                 rotation=Cv2Rotation.NO_ROTATION)
-            },
+            }
+
+        robot_config = SO101FollowerConfig(
+            port= port,
+            use_degrees=True,
+            # for phone camera users you can use the commented out setting below
+            cameras = cameras,
             # for intel realsense camera users you need to modify the serial number or name for your own hardware
             # cameras={
             #     "base_camera": RealSenseCameraConfig(serial_number_or_name="146322070293", fps=30, width=640, height=480)
@@ -41,9 +45,19 @@ class SO101Kinematics:
     All public methods use degrees for input/output.
     """
 
-    def __init__(self, l1=0.1159, l2=0.1350):
+    def __init__(
+        self,
+        l1=0.1159,
+        l2=0.1350,
+        enforce_joint_limits=True,
+        joint2_limits=(-0.1, 3.45),
+        joint3_limits=(-0.2, math.pi),
+    ):
         self.l1 = l1  # Length of the first link (upper arm)
         self.l2 = l2  # Length of the second link (lower arm)
+        self.enforce_joint_limits = enforce_joint_limits
+        self.joint2_limits = joint2_limits
+        self.joint3_limits = joint3_limits
 
     def inverse_kinematics(self, x, y, l1=None, l2=None):
         """
@@ -87,27 +101,36 @@ class SO101Kinematics:
             y *= scale_factor
             r = r_min
         
-        # Use law of cosines to calculate theta2
+        # Use law of cosines to calculate theta2.
+        # The FK model uses l2 at angle (theta1 + theta2 - pi), so theta2 itself
+        # is acos(cos_theta2). Using pi - acos(...) breaks FK/IK round trips and
+        # makes the elbow drift even when the target is the current end-effector pose.
         cos_theta2 = -(r**2 - l1**2 - l2**2) / (2 * l1 * l2)
         
         # Clamp cos_theta2 to valid range [-1, 1] to avoid domain errors
         cos_theta2 = max(-1.0, min(1.0, cos_theta2))
         
         # Calculate theta2 (elbow angle)
-        theta2 = math.pi - math.acos(cos_theta2)
+        theta2 = math.acos(cos_theta2)
         
+        # Clamp elbow first, then recompute shoulder from the clamped elbow.
+        # Otherwise targets above the reachable/allowed workspace can make the
+        # shoulder follow the unconstrained IK branch while the elbow is stuck
+        # at its limit, causing the end effector to move downward.
+        joint3 = theta2 + theta2_offset
+        if self.enforce_joint_limits:
+            joint3 = max(self.joint3_limits[0], min(self.joint3_limits[1], joint3))
+        theta2 = joint3 - theta2_offset
+
         # Calculate theta1 (shoulder angle)
         beta = math.atan2(y, x)
-        gamma = math.atan2(l2 * math.sin(theta2), l1 + l2 * math.cos(theta2))
+        gamma = math.atan2(l2 * math.sin(theta2), l1 - l2 * math.cos(theta2))
         theta1 = beta + gamma
-        
-        # Convert theta1 and theta2 to joint2 and joint3 angles
+
+        # Convert theta1 to joint2 angle and clamp to URDF limits.
         joint2 = theta1 + theta1_offset
-        joint3 = theta2 + theta2_offset
-        
-        # Ensure angles are within URDF limits
-        joint2 = max(-0.1, min(3.45, joint2))
-        joint3 = max(-0.2, min(math.pi, joint3))
+        if self.enforce_joint_limits:
+            joint2 = max(self.joint2_limits[0], min(self.joint2_limits[1], joint2))
         
         # Convert from radians to degrees
         joint2_deg = math.degrees(joint2)
